@@ -1,3 +1,5 @@
 .idea
 .gitignore
 bin
+.env
+./contract/UTC--2025-01-14T11-02-41.636529300Z--0d518a4c445bbfad90c8382a051a91087d930253
