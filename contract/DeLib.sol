@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-pragma solidity >=0.8.22 <0.9.0;
+pragma solidity >=0.8.0 <0.9.0;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
@@ -33,6 +34,12 @@ contract DeLib is ERC20, Ownable, ReentrancyGuard {
         uint8 rating;
     }
 
+    struct Achievement {
+        string name;
+        string description;
+        bool unlocked;
+    }
+
     // Token Economics
     uint256 public constant TOTAL_SUPPLY = 1_000_000_000_000 * 10**18; // 1 trillion tokens
     uint256 public constant MAX_WALLET_PERCENTAGE = 2; // 2% max wallet
@@ -42,6 +49,7 @@ contract DeLib is ERC20, Ownable, ReentrancyGuard {
     uint256 public liquidityFee = 2; // 2% to liquidity
     uint256 public uploadRewardFee = 2; // 2% to book uploaders
     uint256 public reviewRewardFee = 1; // 1% to reviewers
+    uint256 public burnFee = 1; // 1% auto-burn
 
     uint256 public immutable maxWalletAmount;
     uint256 public immutable maxTransactionAmount;
@@ -50,6 +58,9 @@ contract DeLib is ERC20, Ownable, ReentrancyGuard {
     uint256 public constant UPLOAD_REWARD = 1000 * 10**18; // 1000 tokens for upload
     uint256 public constant REVIEW_REWARD = 100 * 10**18; // 100 tokens for review
     uint256 public constant REPORT_REWARD = 50 * 10**18; // 50 tokens for valid report
+
+    // State Variables
+    bool public isPaused;
 
     // Mappings
     mapping(uint256 => Book) public books;
@@ -60,6 +71,13 @@ contract DeLib is ERC20, Ownable, ReentrancyGuard {
     mapping(uint256 => mapping(address => bool)) public hasReviewed;
     mapping(address => bool) public isExcludedFromLimits;
     mapping(address => bool) public isExcludedFromFees;
+
+    // Social Features
+    mapping(address => address[]) public following;
+    mapping(address => address[]) public followers;
+    mapping(uint256 => mapping(address => bool)) public favoriteBooks;
+    mapping(uint256 => uint256) public favoritesCount;
+    mapping(address => Achievement[]) public userAchievements;
 
     // Counters
     uint256 public bookCount;
@@ -74,6 +92,10 @@ contract DeLib is ERC20, Ownable, ReentrancyGuard {
     event ReportVoted(uint256 indexed reportId, address indexed voter, uint256 totalVotes);
     event BookReviewed(uint256 indexed bookId, address indexed reviewer, uint8 rating, string comment);
     event RewardDistributed(address indexed user, uint256 amount, string reason);
+    event AchievementUnlocked(address indexed user, string name);
+    event UserFollowed(address indexed follower, address indexed followed);
+    event BookFavorited(uint256 indexed bookId, address indexed user, bool status);
+    event TokensBurned(address indexed from, uint256 amount);
 
     constructor() ERC20("Ohara", "OH") Ownable(msg.sender) {
         maxWalletAmount = (TOTAL_SUPPLY * MAX_WALLET_PERCENTAGE) / 100;
@@ -105,6 +127,11 @@ contract DeLib is ERC20, Ownable, ReentrancyGuard {
         _;
     }
 
+    modifier notPaused() {
+        require(!isPaused, "Contract is paused");
+        _;
+    }
+
     // Token Management Functions
     function _update(
         address from,
@@ -126,11 +153,18 @@ contract DeLib is ERC20, Ownable, ReentrancyGuard {
                 uint256 liquidityAmount = (amount * liquidityFee) / 100;
                 uint256 uploadRewardAmount = (amount * uploadRewardFee) / 100;
                 uint256 reviewRewardAmount = (amount * reviewRewardFee) / 100;
+                uint256 burnAmount = (amount * burnFee) / 100;
                 uint256 totalFee = taxAmount + liquidityAmount + uploadRewardAmount + reviewRewardAmount;
 
                 if (totalFee > 0) {
                     super._update(from, address(this), totalFee);
                     amount -= totalFee;
+                }
+
+                if (burnAmount > 0) {
+                    _burn(from, burnAmount);
+                    emit TokensBurned(from, burnAmount);
+                    amount -= burnAmount;
                 }
             }
         }
@@ -143,7 +177,7 @@ contract DeLib is ERC20, Ownable, ReentrancyGuard {
         string memory _title,
         string memory _author,
         string memory _ipfsHash
-    ) public notBlacklisted nonReentrant {
+    ) public notBlacklisted notPaused nonReentrant {
         require(bytes(_title).length > 0, "Title cannot be empty");
         require(bytes(_author).length > 0, "Author cannot be empty");
         require(bytes(_ipfsHash).length > 0, "IPFS hash cannot be empty");
@@ -162,12 +196,14 @@ contract DeLib is ERC20, Ownable, ReentrancyGuard {
 
         // Reward uploader
         _distributeReward(msg.sender, UPLOAD_REWARD, "Book Upload");
+        checkAndUpdateAchievements(msg.sender);
         emit BookUploaded(bookCount, _title, _ipfsHash, msg.sender);
     }
 
     function reviewBook(uint256 _bookId, uint8 _rating, string memory _comment)
     public
     notBlacklisted
+    notPaused
     validBookId(_bookId)
     activeBook(_bookId)
     nonReentrant
@@ -181,44 +217,134 @@ contract DeLib is ERC20, Ownable, ReentrancyGuard {
         bookReviews[_bookId].push(Review(_bookId, msg.sender, _comment, _rating));
         hasReviewed[_bookId][msg.sender] = true;
 
-        // Reward reviewer
-        _distributeReward(msg.sender, REVIEW_REWARD, "Book Review");
+        // Calculate and distribute reward
+        uint256 reward = calculateReviewReward(msg.sender);
+        _distributeReward(msg.sender, reward, "Book Review");
+        checkAndUpdateAchievements(msg.sender);
         emit BookReviewed(_bookId, msg.sender, _rating, _comment);
     }
 
-    function reportBook(uint256 _bookId, string memory _reason)
-    public
-    notBlacklisted
-    validBookId(_bookId)
-    activeBook(_bookId)
-    nonReentrant
-    {
-        require(bytes(_reason).length > 0, "Reason cannot be empty");
-
-        reportCount++;
-        reports[reportCount] = Report(_bookId, msg.sender, _reason, 0, false);
-
-        emit ReportSubmitted(reportCount, _bookId, msg.sender, _reason);
+    // Social Functions
+    function followUser(address _user) external notBlacklisted notPaused {
+        require(_user != msg.sender, "Cannot follow yourself");
+        require(!blacklist[_user], "User is blacklisted");
+        following[msg.sender].push(_user);
+        followers[_user].push(msg.sender);
+        emit UserFollowed(msg.sender, _user);
     }
 
-    function voteOnReport(uint256 _reportId) public notBlacklisted nonReentrant {
-        require(_reportId > 0 && _reportId <= reportCount, "Invalid report ID");
-        require(!hasVotedReport[_reportId][msg.sender], "Already voted on this report");
-        require(!reports[_reportId].resolved, "Report already resolved");
+    function toggleFavorite(uint256 _bookId) external notBlacklisted validBookId(_bookId) notPaused {
+        bool newStatus = !favoriteBooks[_bookId][msg.sender];
+        favoriteBooks[_bookId][msg.sender] = newStatus;
+        if(newStatus) {
+            favoritesCount[_bookId]++;
+        } else {
+            favoritesCount[_bookId]--;
+        }
+        emit BookFavorited(_bookId, msg.sender, newStatus);
+    }
 
-        Report storage report = reports[_reportId];
-        report.votes++;
-        hasVotedReport[_reportId][msg.sender] = true;
-
-        if (report.votes >= REPORT_THRESHOLD) {
-            books[report.bookId].isActive = false;
-            report.resolved = true;
-            // Reward reporter for valid report
-            _distributeReward(report.reporter, REPORT_REWARD, "Valid Report");
-            emit BookRemoved(report.bookId, report.reason);
+    // Reward System Functions
+    function calculateReviewReward(address _reviewer) internal view returns (uint256) {
+        uint256 reviewCount;
+        for(uint i = 1; i <= bookCount; i++) {
+            if(hasReviewed[i][_reviewer]) reviewCount++;
         }
 
-        emit ReportVoted(_reportId, msg.sender, report.votes);
+        // Bonus 10% setiap 10 review
+        uint256 bonusMultiplier = (reviewCount / 10) * 10;
+        return REVIEW_REWARD + (REVIEW_REWARD * bonusMultiplier / 100);
+    }
+
+    function checkAndUpdateAchievements(address _user) internal {
+        // First Upload Achievement
+        if(getUserUploadCount(_user) == 1) {
+            unlockAchievement(_user, "First Upload", "Upload your first book");
+        }
+
+        // Prolific Author Achievement
+        if(getUserUploadCount(_user) >= 5) {
+            unlockAchievement(_user, "Prolific Author", "Upload 5 or more books");
+        }
+
+        // Active Reviewer Achievement
+        if(getUserReviewCount(_user) >= 10) {
+            unlockAchievement(_user, "Active Reviewer", "Write 10 or more reviews");
+        }
+    }
+
+    function unlockAchievement(address _user, string memory _name, string memory _description) internal {
+        if(!hasAchievement(_user, _name)) {
+            Achievement memory newAchievement = Achievement(_name, _description, true);
+            userAchievements[_user].push(newAchievement);
+            _distributeReward(_user, 500 * 10**18, "Achievement Reward");
+            emit AchievementUnlocked(_user, _name);
+        }
+    }
+
+    // Admin Functions
+    function setPause(bool _state) external onlyOwner {
+        isPaused = _state;
+    }
+
+    function removeFromBlacklist(address _user) public onlyOwner {
+        blacklist[_user] = false;
+    }
+
+    function emergencyWithdraw(address _token) external onlyOwner {
+        if(_token == address(0)) {
+            payable(owner()).transfer(address(this).balance);
+        } else {
+            IERC20(_token).transfer(owner(), IERC20(_token).balanceOf(address(this)));
+        }
+    }
+
+    // View Functions
+    function getBookReviews(uint256 _bookId) external view returns (Review[] memory) {
+        return bookReviews[_bookId];
+    }
+
+    function getPlatformStats() external view returns (
+        uint256 totalBooks,
+        uint256 totalActiveBooks,
+        uint256 totalReports,
+        uint256 totalReviews
+    ) {
+        uint256 activeBooks;
+        uint256 reviews;
+
+        for(uint i = 1; i <= bookCount; i++) {
+            if(books[i].isActive) activeBooks++;
+            reviews += books[i].rankCount;
+        }
+
+        return (bookCount, activeBooks, reportCount, reviews);
+    }
+
+    function getUserUploadCount(address _user) public view returns (uint256) {
+        uint256 count;
+        for(uint i = 1; i <= bookCount; i++) {
+            if(books[i].uploader == _user) count++;
+        }
+        return count;
+    }
+
+    function getUserReviewCount(address _user) public view returns (uint256) {
+        uint256 count;
+        for(uint i = 1; i <= bookCount; i++) {
+            if(hasReviewed[i][_user]) count++;
+        }
+        return count;
+    }
+
+    function hasAchievement(address _user, string memory _name) public view returns (bool) {
+        Achievement[] memory achievements = userAchievements[_user];
+        for(uint i = 0; i < achievements.length; i++) {
+            if(keccak256(bytes(achievements[i].name)) == keccak256(bytes(_name))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // Internal Functions
@@ -227,61 +353,5 @@ contract DeLib is ERC20, Ownable, ReentrancyGuard {
             _transfer(address(this), user, amount);
             emit RewardDistributed(user, amount, reason);
         }
-    }
-
-    // Admin Functions
-    function setFees(
-        uint256 _taxFee,
-        uint256 _liquidityFee,
-        uint256 _uploadRewardFee,
-        uint256 _reviewRewardFee
-    ) external onlyOwner {
-        require(_taxFee + _liquidityFee + _uploadRewardFee + _reviewRewardFee <= 10, "Total fee exceeds 10%");
-        taxFee = _taxFee;
-        liquidityFee = _liquidityFee;
-        uploadRewardFee = _uploadRewardFee;
-        reviewRewardFee = _reviewRewardFee;
-    }
-
-    function setExcludedFromLimits(address account, bool excluded) external onlyOwner {
-        isExcludedFromLimits[account] = excluded;
-    }
-
-    function setExcludedFromFees(address account, bool excluded) external onlyOwner {
-        isExcludedFromFees[account] = excluded;
-    }
-
-    function addToBlacklist(address _user) public onlyOwner {
-        require(_user != address(0), "Invalid address");
-        blacklist[_user] = true;
-    }
-
-    // View Functions
-    function getBook(uint256 _bookId)
-    public
-    view
-    validBookId(_bookId)
-    returns (
-        string memory title,
-        string memory author,
-        string memory ipfsHash,
-        address uploader,
-        uint256 timestamp,
-        uint256 rank,
-        bool isActive
-    )
-    {
-        Book memory book = books[_bookId];
-        uint256 calculatedRank = book.rankCount > 0 ? book.rankSum / book.rankCount : 0;
-
-        return (
-            book.title,
-            book.author,
-            book.ipfsHash,
-            book.uploader,
-            book.timestamp,
-            calculatedRank,
-            book.isActive
-        );
     }
 }
